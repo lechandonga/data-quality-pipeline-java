@@ -1,0 +1,51 @@
+[
+  {
+    "id": "id-not-null",
+    "type": "NOT_NULL",
+    "field": "id"
+  },
+  {
+    "id": "id-unique",
+    "type": "UNIQUE",
+    "field": "id"
+  },
+  {
+    "id": "name-not-null",
+    "type": "NOT_NULL",
+    "field": "name"
+  },
+  {
+    "id": "age-range",
+    "type": "RANGE",
+    "field": "age",
+    "params": { "min": "0", "max": "150" },
+    "nullable": true
+  },
+  {
+    "id": "email-format",
+    "type": "REGEX",
+    "field": "email",
+    "params": { "pattern": "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$" },
+    "nullable": true
+  },
+  {
+    "id": "end-after-start",
+    "type": "CROSS_FIELD",
+    "field": "end",
+    "params": { "otherField": "start", "operator": "GREATER_THAN" },
+    "nullable": true
+  },
+  {
+    "id": "contact-present",
+    "type": "COMPOSITE",
+    "field": "contact",
+    "params": { "mode": "ANY", "rules": "email-format,phone-format" }
+  },
+  {
+    "id": "phone-format",
+    "type": "REGEX",
+    "field": "phone",
+    "params": { "pattern": "^\\d{6,15}$" },
+    "nullable": true
+  }
+]
