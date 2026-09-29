@@ -3,6 +3,9 @@ package com.github.lechandonga.dataqualitypipelinejava.config;
 import com.github.lechandonga.dataqualitypipelinejava.baseline.BaselineStore;
 import com.github.lechandonga.dataqualitypipelinejava.baseline.FileBaselineStore;
 import com.github.lechandonga.dataqualitypipelinejava.baseline.InMemoryBaselineStore;
+import com.github.lechandonga.dataqualitypipelinejava.archive.BatchArchive;
+import com.github.lechandonga.dataqualitypipelinejava.archive.FileBatchArchive;
+import com.github.lechandonga.dataqualitypipelinejava.archive.InMemoryBatchArchive;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -21,5 +24,13 @@ public class PipelineConfig {
             return new FileBaselineStore(props.baselineDir());
         }
         return new InMemoryBaselineStore();
+    }
+
+    @Bean
+    public BatchArchive batchArchive(PipelineProperties props) {
+        if (props.archiveDir() != null && !props.archiveDir().isBlank()) {
+            return new FileBatchArchive(props.archiveDir());
+        }
+        return new InMemoryBatchArchive();
     }
 }

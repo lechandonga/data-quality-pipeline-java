@@ -33,7 +33,7 @@ class BaselinePipelineTest {
 
     private PipelineProperties props(double meanThreshold, double nullThreshold) {
         return new PipelineProperties(4, 8, 100, 10_000,
-                OverflowPolicy.ISOLATE, meanThreshold, nullThreshold, null);
+                OverflowPolicy.ISOLATE, meanThreshold, nullThreshold, null, null, 100);
     }
 
     @BeforeEach
@@ -136,7 +136,7 @@ class BaselinePipelineTest {
     void rejectedBatchNeverPollutesBaseline() {
         // REJECT 策略 + 极小唯一键容量：超过容量的全新键无法确认唯一，整批拒绝
         PipelineProperties rejectProps = new PipelineProperties(4, 8, 1_000, 2,
-                OverflowPolicy.REJECT, 3.0, 0.3, null);
+                OverflowPolicy.REJECT, 3.0, 0.3, null, null, 100);
         PipelineService rejecting = new PipelineService(registry, new BaselineService(store), rejectProps);
         registry.replaceAll(List.of(
                 com.github.lechandonga.dataqualitypipelinejava.tests.TestData

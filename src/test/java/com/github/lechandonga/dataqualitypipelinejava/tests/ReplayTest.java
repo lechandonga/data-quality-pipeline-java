@@ -10,6 +10,8 @@ import com.github.lechandonga.dataqualitypipelinejava.model.OverflowPolicy;
 import com.github.lechandonga.dataqualitypipelinejava.model.RecordStatus;
 import com.github.lechandonga.dataqualitypipelinejava.pipeline.ExecutionRequest;
 import com.github.lechandonga.dataqualitypipelinejava.pipeline.PipelineService;
+import com.github.lechandonga.dataqualitypipelinejava.pipeline.ReplayOutcome;
+import com.github.lechandonga.dataqualitypipelinejava.pipeline.ReplayRejectedException;
 import com.github.lechandonga.dataqualitypipelinejava.rule.RuleCompiler;
 import com.github.lechandonga.dataqualitypipelinejava.rule.RuleRegistry;
 import org.junit.jupiter.api.BeforeEach;
@@ -36,7 +38,7 @@ class ReplayTest {
 
     private PipelineProperties props() {
         return new PipelineProperties(4, 8, 256, 1_000_000,
-                OverflowPolicy.ISOLATE, 3.0, 0.3, null);
+                OverflowPolicy.ISOLATE, 3.0, 0.3, null, null, 100);
     }
 
     @BeforeEach
@@ -73,7 +75,7 @@ class ReplayTest {
         // 修复 rec-1 与 rec-2（rec-3 仍与 rec-0 冲突，保持隔离）
         BatchResult replayed = pipeline.replay("b1", List.of(
                 recV(1, "rec-1", "id-1", "50"),
-                recV(2, "rec-2", "id-2", "20")).iterator());
+                recV(2, "rec-2", "id-2", "20")).iterator()).batch();
 
         assertEquals(4, replayed.total(), "replay must not duplicate records");
         assertEquals(3, replayed.passedCount());
@@ -82,7 +84,7 @@ class ReplayTest {
         // 再次同样重放，结论不变（幂等）
         BatchResult again = pipeline.replay("b1", List.of(
                 recV(1, "rec-1", "id-1", "50"),
-                recV(2, "rec-2", "id-2", "20")).iterator());
+                recV(2, "rec-2", "id-2", "20")).iterator()).batch();
         assertEquals(replayed.passedCount(), again.passedCount());
         assertEquals(replayed.quarantinedCount(), again.quarantinedCount());
         assertEquals(
@@ -97,7 +99,7 @@ class ReplayTest {
                 recV(1, "rec-1", "id-1", "999")).iterator());
 
         BatchResult replayed = pipeline.replay("b1", List.of(
-                recV(1, "rec-1", "id-1", "50")).iterator());
+                recV(1, "rec-1", "id-1", "50")).iterator()).batch();
 
         // rec-0 结论与输入顺序位置不变
         assertEquals("rec-0", replayed.violations().get(0).recordId());
@@ -117,9 +119,10 @@ class ReplayTest {
                 range("r-v", "v", "0", "10"),
                 unique("u-id", List.of("id"))));
 
-        assertThrows(IllegalStateException.class,
+        ReplayRejectedException ex = assertThrows(ReplayRejectedException.class,
                 () -> pipeline.replay("b1", List.of(recV(1, "rec-1", "id-1", "5")).iterator()),
                 "replay under a different rules version must be refused (reproducibility)");
+        assertEquals("RULES_VERSION_MISMATCH", ex.reason());
     }
 
     @Test
@@ -131,7 +134,8 @@ class ReplayTest {
         assertEquals(BatchStatus.COMMITTED, committed.status());
         long batchesAfterCommit = store.load("ds").orElseThrow().batchCount();
 
-        BatchResult replayed = pipeline.replay("b1", List.of(recV(1, "rec-1", "id-1", "50")).iterator());
+        BatchResult replayed = pipeline.replay("b1",
+                List.of(recV(1, "rec-1", "id-1", "50")).iterator()).batch();
         assertTrue(replayed.baselineUpdated(), "replay keeps original committed flag");
         assertEquals(batchesAfterCommit, store.load("ds").orElseThrow().batchCount(),
                 "replay must not add another baseline revision");
@@ -139,8 +143,9 @@ class ReplayTest {
 
     @Test
     void replayUnknownBatchFails() {
-        assertThrows(IllegalArgumentException.class,
+        ReplayRejectedException unknown = assertThrows(ReplayRejectedException.class,
                 () -> pipeline.replay("nope", List.of(recV(0, "x", "id", "1")).iterator()));
+        assertEquals("BATCH_NOT_FOUND", unknown.reason());
     }
 
     @Test
@@ -148,11 +153,15 @@ class ReplayTest {
         pipeline.execute(ExecutionRequest.of("b1", "ds", false), List.of(
                 recV(0, "rec-0", "id-0", "10"),
                 recV(1, "rec-1", "id-0", "10")).iterator());
-        BatchResult r = pipeline.replay("b1", List.of(recV(1, "rec-1", "id-0", "10")).iterator());
+        ReplayOutcome outcome = pipeline.replay("b1",
+                List.of(recV(1, "rec-1", "id-0", "10")).iterator());
+        BatchResult r = outcome.batch();
         var stillBad = r.violations().get(1);
         assertEquals(RecordStatus.QUARANTINED, stillBad.status());
         assertEquals("u-id", stillBad.reasons().get(0).ruleId());
         assertEquals("id", stillBad.reasons().get(0).field());
         assertFalse(stillBad.reasons().get(0).expected().isBlank());
+        assertEquals(List.of("rec-1"), outcome.stillQuarantined());
+        assertTrue(outcome.nowPassed().isEmpty());
     }
 }

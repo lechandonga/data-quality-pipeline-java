@@ -18,7 +18,8 @@ public record BatchResult(
         List<RuleViolation> violations,
         List<DriftFinding> driftFindings,
         boolean baselineUpdated,
-        String rejectReason
+        String rejectReason,
+        PersistenceStatus persistenceStatus
 ) {
 
     public boolean committed() {

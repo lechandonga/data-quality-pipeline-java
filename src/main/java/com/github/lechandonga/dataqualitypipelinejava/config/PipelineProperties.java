@@ -14,6 +14,8 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
  * @param meanShiftThreshold     均值漂移阈值（以基线标准差为单位，z-score）
  * @param stdShiftThreshold      标准差漂移阈值（倍数）
  * @param baselineDir            基线持久化目录；null/空表示仅内存
+ * @param archiveDir             批次存档目录；null/空表示批次结论仅保留在进程内存
+ * @param maxRetainedBatches     进程内同时保留的完整批次数量上限；超出后最旧批次先被逐出
  */
 @ConfigurationProperties(prefix = "dqp")
 public record PipelineProperties(
@@ -24,7 +26,9 @@ public record PipelineProperties(
         OverflowPolicy overflowPolicy,
         double meanShiftThreshold,
         double stdShiftThreshold,
-        String baselineDir
+        String baselineDir,
+        String archiveDir,
+        int maxRetainedBatches
 ) {
 
     public PipelineProperties {
@@ -52,11 +56,17 @@ public record PipelineProperties(
         if (baselineDir != null && baselineDir.isBlank()) {
             baselineDir = null;
         }
+        if (archiveDir != null && archiveDir.isBlank()) {
+            archiveDir = null;
+        }
+        if (maxRetainedBatches <= 0) {
+            maxRetainedBatches = 100;
+        }
     }
 
     /** 默认配置，供测试与无配置启动使用。 */
     public static PipelineProperties defaults() {
         return new PipelineProperties(4, 8, 10_000, 1_000_000,
-                OverflowPolicy.ISOLATE, 3.0, 2.0, null);
+                OverflowPolicy.ISOLATE, 3.0, 2.0, null, null, 100);
     }
 }

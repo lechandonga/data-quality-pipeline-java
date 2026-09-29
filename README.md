@@ -13,8 +13,9 @@
 要求 JDK 21+、Maven 3.9+。
 
 ```bash
-# 全量测试（59 个用例，重点覆盖边界与异常：规则冲突、基线缺失/更新失败、
-# 超大流式输入、并发批次、容量边界、隔离重放、跨线程可复现）
+# 全量测试（重点覆盖边界与异常：规则冲突、基线缺失/更新失败、
+# 超大流式输入、并发批次、容量边界、隔离重放、跨线程可复现、
+# 批次存档重启、内存逐出、落盘失败/存档损坏、导出-重放闭环）
 mvn test
 
 # 启动本地服务（默认端口 8080，基线默认仅内存）
@@ -52,6 +53,12 @@ curl -s localhost:8080/api/batches/b-20260921-01
 printf '%s\n' '{"id":"r2","data":{"id":"k2","name":"b","age":"20","start":"1","end":"2"}}' \
   | curl -s -X POST localhost:8080/api/batches/b-20260921-01/replay \
       -H 'Content-Type: application/x-ndjson' --data-binary @-
+
+# 5) 导出当前仍隔离的记录为修复文件（原样 NDJSON：保留 id、原始顺序与字段）
+curl -s localhost:8080/api/batches/b-20260921-01/quarantine/export -o b1.quarantine.ndjson
+#    人工/脚本修复字段后，原样回灌即可
+curl -s -X POST localhost:8080/api/batches/b-20260921-01/replay \
+  -H 'Content-Type: application/x-ndjson' --data-binary @b1.quarantine.ndjson
 ```
 
 ## 2. 规则语义
@@ -115,19 +122,57 @@ printf '%s\n' '{"id":"r2","data":{"id":"k2","name":"b","age":"20","start":"1","e
 | `dqp.mean-shift-threshold` | 3.0 | 均值漂移的 z-score 阈值。 |
 | `dqp.std-shift-threshold` | 0.3 | 缺失率漂移的绝对差阈值。 |
 | `dqp.baseline-dir` | 空（内存） | 配置目录后启用文件基线（原子写、跨重启保留）；损坏的基线文件会显式报错而非静默重置。 |
+| `dqp.archive-dir` | 空（内存） | 配置目录后启用**批次存档**：批次完整结论（状态、各计数、每条记录原始内容与判定依据）原子落盘；重启后可按批次标识查询，规则版本一致时可继续导出/重放。损坏存档显式报错（HTTP 500 `ARCHIVE_CORRUPTED`），不静默当成不存在。 |
+| `dqp.max-retained-batches` | 100 | 进程内同时保留的完整批次数量上限。超过后**最旧批次先移出内存**：启用存档时逐出后仍可从磁盘回查/重放；未启用存档时查询返回 **410 Gone**（"曾经存在但已不可用"），与 404（从未存在）严格区分。 |
 
 输入全程通过迭代器/有界队列流式处理，不做全量加载；集成测试中 100,000 条记录
 在 `queue-capacity=64` 下完整处理，`overflowIsolatedCount=0`、结论全量一致。
 
-## 5. 隔离与重放
+## 5. 批次存档、内存保留与隔离重放闭环
+
+### 开启 vs 未开启存档
+
+| | 配置 `dqp.archive-dir`（开启） | 留空（默认，仅内存） |
+|---|---|---|
+| 批次结论中的 `persistenceStatus` | 落盘成功为 `PERSISTED`；落盘失败为 `NOT_PERSISTED`（本次结论照常返回，但明确告知未安全落盘） | 恒为 `IN_MEMORY_ONLY` |
+| 服务重启后 | 按批次标识查询/导出/重放，结论与执行当时逐条一致 | 结论随进程消失 |
+| 超过 `max-retained-batches` 被逐出内存 | 自动从存档回读（透明水合），查询与重放照常 | 查询返回 410 Gone、导出/重放返回 `BATCH_EVICTED` |
+| 存档文件损坏 | 查询/导出返回 500 `ARCHIVE_CORRUPTED`，绝不静默当成"不存在" | 不适用 |
+
+落盘为**原子写**（同目录临时文件 + `ATOMIC_MOVE`，文件系统不支持时退化为按目标文件
+加锁串行的普通 move）：中途失败/被打断要么保留上一份完整存档、要么完整的新存档可见，
+不留半个批次的残档；落盘失败不影响本次执行返回的结论，只把它标记成 `NOT_PERSISTED`。
+
+### 查询的四种结局（`GET /api/batches/{batchId}`）
+
+- `200`：完整结论（内存命中或从存档回读，内容一致）；
+- `404`：该批次标识**从未执行过**；
+- `410 Gone`：批次确实执行过，但未开启存档且已被内存上限逐出（"曾经存在但已不可用"）；
+- `500 ARCHIVE_CORRUPTED`：磁盘存档存在但已损坏（截断/非法 JSON/计数与条目不一致等）。
+
+### 隔离、导出与重放
 
 - 不合格记录进入隔离集，结论保留 `ruleId + field + actual + expected`；
   UNIQUE 失败还会指向首次占用该键的记录。
+- **导出**：`GET /api/batches/{batchId}/quarantine/export` 返回当前仍隔离记录的
+  NDJSON 修复文件，保留记录标识、**原始输入顺序**与**原始字段内容**（缺失字段保持缺失），
+  一个字不改；修复字段值后可直接 POST 回 `/replay`。
+- **重放**：`POST /api/batches/{batchId}/replay`，请求体为修复后的 NDJSON。响应：
+  - `batch`：整批最新完整结论（字段同执行响应）；
+  - `nowPassed`：本次提交记录中因修复转为通过的 id；
+  - `stillQuarantined`：重放后全批次仍隔离的 id（含本次没参与提交的）。
 - 重放按 `recordId` 用新结论替换旧结论：
-  - 已通过记录的结论永不改变、位置不变；
-  - 唯一性判定包含当前所有已通过记录的键，修复后重复计数不会复活；
-  - 同一批修复记录反复重放，结论完全幂等；
+  - 输入每条 id 都必须属于"当前仍隔离清单"，或是历次重放修复过的 id（保证幂等）；
+    其余 id（原始即通过、从未出现）以及**输入内重复的 id**一律整体拒绝
+    （HTTP 422，原因码 `NOT_IN_QUARANTINE`）：**整体不生效**，不允许只重放一部分，
+    也不会把陌生记录悄悄当作新记录计入批次，已通过记录结论不受影响；
+  - 规则版本与执行当时不一致时拒绝（422 `RULES_VERSION_MISMATCH`）；
+  - 已通过记录的结论永不改变、位置不变；唯一性判定包含当前所有已通过记录的键；
+  - 同一批修复记录反复重放，结论完全幂等；重放绝不二次更新基线；
   - 重放期间若触发 `REJECT`（硬上限），保留原批次结论，不产生部分重放。
+- **两条硬不变量**（均有自动化测试）：
+  1. 导出文件一个字不改直接重放，整批结论与导出前**逐条一致**；
+  2. 任意修复重放完成后，全批次结论恒等于"拿当前这批记录（含还没修复的）从头完整跑一遍"。
 
 ## 6. 可复现性的具体保证
 
@@ -153,3 +198,27 @@ printf '%s\n' '{"id":"r2","data":{"id":"k2","name":"b","age":"20","start":"1","e
 - 提交结果：`batch COMMITTED / ACCEPTED (dry-run)`；
   基线写入失败：`baseline commit failed; batch NOT committed, old baseline preserved`
 - 规则发布：`rules replaced atomically: version=..., rowRules=..., uniqueRules=...`
+
+## 8. 本地验证
+
+```bash
+# 全量测试（73 个用例，含存档重启、内存逐出、落盘失败/存档损坏、导出原样重放、
+# 修复重放与整批重跑等价、非隔离记录整体拒绝、并发逐出/查询/重放）
+mvn test
+
+# 开启批次存档启动（另开终端用第 1 节的 curl 流程执行批次）
+mvn spring-boot:run -Dspring-boot.run.arguments=--dqp.archive-dir=./.dqp-batches
+
+# 验证"重启可查、可继续重放"：
+# 1) 执行批次 -> 响应 persistenceStatus=PERSISTED，
+#    ./.dqp-batches/<batchId>.batch.json 原子落盘
+# 2) 停掉服务再重启（仍指向同一目录）
+# 3) curl localhost:8080/api/batches/<batchId>            # 仍是执行当时的完整结论
+# 4) curl .../quarantine/export 导出 -> 修复 -> POST /replay
+```
+
+新增覆盖集中在
+`src/test/java/com/github/lechandonga/dataqualitypipelinejava/tests/BatchArchivePersistenceTest.java`
+（重启后查询与重放、内存逐出与回查、落盘失败、存档损坏、导出原样重放一致、
+修复重放与整批重跑等价、非隔离清单整体拒绝、并发安全）以及
+`PipelineIntegrationTest` 中的导出/422 端到端用例。

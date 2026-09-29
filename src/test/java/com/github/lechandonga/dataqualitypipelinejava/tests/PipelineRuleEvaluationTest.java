@@ -37,7 +37,7 @@ class PipelineRuleEvaluationTest {
 
     private PipelineProperties props() {
         return new PipelineProperties(4, 8, 100, 10_000,
-                OverflowPolicy.ISOLATE, 3.0, 0.3, null);
+                OverflowPolicy.ISOLATE, 3.0, 0.3, null, null, 100);
     }
 
     @BeforeEach

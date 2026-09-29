@@ -16,6 +16,8 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 @SpringBootTest(properties = {
         "dqp.worker-threads=2",
@@ -84,9 +86,65 @@ class PipelineIntegrationTest {
                 """;
         mvc.perform(post("/api/batches/int-1/replay").contentType(NDJSON).content(repaired))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.total").value(3))
-                .andExpect(jsonPath("$.passedCount").value(2))
+                .andExpect(jsonPath("$.batch.total").value(3))
+                .andExpect(jsonPath("$.batch.passedCount").value(2))
+                .andExpect(jsonPath("$.batch.quarantinedCount").value(1))
+                .andExpect(jsonPath("$.nowPassed[0]").value("r2"))
+                .andExpect(jsonPath("$.stillQuarantined[0]").value("r3"));
+    }
+
+    @Test
+    void exportQuarantineAndForeignRecordWholeReplayRejection() throws Exception {
+        String rules = """
+                {"rules":[
+                  {"id":"nn-name","type":"NOT_NULL","field":"name"},
+                  {"id":"u-id","type":"UNIQUE","children":["id"]}
+                ]}
+                """;
+        mvc.perform(put("/api/rules").contentType(MediaType.APPLICATION_JSON).content(rules))
+                .andExpect(status().isOk());
+
+        String ndjson = """
+                {"id":"r1","data":{"id":"k1","name":"a"}}
+                {"id":"r2","data":{"id":"k2","name":""}}
+                """;
+        mvc.perform(post("/api/batches/int-export/execute")
+                        .param("dataset", "people")
+                        .contentType(NDJSON).content(ndjson))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.persistenceStatus").value("IN_MEMORY_ONLY"));
+
+        // 导出：原样 NDJSON，只含仍隔离的 r2，保留原始字段
+        String exported = mvc.perform(get("/api/batches/int-export/quarantine/export"))
+                .andExpect(status().isOk())
+                .andReturn().getResponse().getContentAsString();
+        assertTrue(exported.contains("\"id\":\"r2\""));
+        assertFalse(exported.contains("\"id\":\"r1\""));
+
+        // 原样回灌重放：r2 仍因空名字隔离，整批结论不变
+        mvc.perform(post("/api/batches/int-export/replay")
+                        .contentType(NDJSON).content(exported))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.batch.quarantinedCount").value(1))
+                .andExpect(jsonPath("$.stillQuarantined[0]").value("r2"));
+
+        // 混入已通过的 r1：整体拒绝 422，不可部分重放
+        String mixed = """
+                {"id":"r2","data":{"id":"k2","name":"fixed"}}
+                {"id":"r1","data":{"id":"k1","name":"a"}}
+                """;
+        mvc.perform(post("/api/batches/int-export/replay")
+                        .contentType(NDJSON).content(mixed))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.reason").value("NOT_IN_QUARANTINE"));
+
+        // 结论未被部分重放改动：r2 仍隔离
+        mvc.perform(get("/api/batches/int-export"))
+                .andExpect(status().isOk())
                 .andExpect(jsonPath("$.quarantinedCount").value(1));
+
+        // 不存在的批次：404；重放同样区分原因
+        mvc.perform(get("/api/batches/no-such-batch")).andExpect(status().isNotFound());
     }
 
     @Test

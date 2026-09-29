@@ -67,6 +67,6 @@ final class TestData {
     static PipelineProperties props(int workers, int queueCapacity, int distinctCapacity,
                                     OverflowPolicy policy) {
         return new PipelineProperties(workers, 8, queueCapacity, distinctCapacity,
-                policy, 3.0, 0.3, null);
+                policy, 3.0, 0.3, null, null, 100);
     }
 }
