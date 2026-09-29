@@ -84,9 +84,13 @@ class PipelineIntegrationTest {
                 """;
         mvc.perform(post("/api/batches/int-1/replay").contentType(NDJSON).content(repaired))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.total").value(3))
-                .andExpect(jsonPath("$.passedCount").value(2))
-                .andExpect(jsonPath("$.quarantinedCount").value(1));
+                .andExpect(jsonPath("$.result.total").value(3))
+                .andExpect(jsonPath("$.result.passedCount").value(2))
+                .andExpect(jsonPath("$.result.quarantinedCount").value(1))
+                .andExpect(jsonPath("$.repairedPassed[0]").value("r2"))
+                .andExpect(jsonPath("$.stillQuarantined[0]").value("r3"))
+                .andExpect(jsonPath("$.notInQuarantineList").isEmpty())
+                .andExpect(jsonPath("$.rejected").value(false));
     }
 
     @Test

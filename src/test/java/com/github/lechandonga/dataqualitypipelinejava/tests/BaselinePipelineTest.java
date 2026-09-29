@@ -33,14 +33,14 @@ class BaselinePipelineTest {
 
     private PipelineProperties props(double meanThreshold, double nullThreshold) {
         return new PipelineProperties(4, 8, 100, 10_000,
-                OverflowPolicy.ISOLATE, meanThreshold, nullThreshold, null);
+                OverflowPolicy.ISOLATE, meanThreshold, nullThreshold, null, null, 100);
     }
 
     @BeforeEach
     void setUp() {
         store = new InMemoryBaselineStore();
         registry = new RuleRegistry(new RuleCompiler());
-        pipeline = new PipelineService(registry, new BaselineService(store), props(3.0, 0.3));
+        pipeline = PipelineService.withoutArchive(registry, new BaselineService(store), props(3.0, 0.3));
     }
 
     private BatchResult execute(String batchId, String dataset, boolean commit,
@@ -136,8 +136,8 @@ class BaselinePipelineTest {
     void rejectedBatchNeverPollutesBaseline() {
         // REJECT 策略 + 极小唯一键容量：超过容量的全新键无法确认唯一，整批拒绝
         PipelineProperties rejectProps = new PipelineProperties(4, 8, 1_000, 2,
-                OverflowPolicy.REJECT, 3.0, 0.3, null);
-        PipelineService rejecting = new PipelineService(registry, new BaselineService(store), rejectProps);
+                OverflowPolicy.REJECT, 3.0, 0.3, null, null, 100);
+        PipelineService rejecting = PipelineService.withoutArchive(registry, new BaselineService(store), rejectProps);
         registry.replaceAll(List.of(
                 com.github.lechandonga.dataqualitypipelinejava.tests.TestData
                         .unique("u-v", List.of("v"))));

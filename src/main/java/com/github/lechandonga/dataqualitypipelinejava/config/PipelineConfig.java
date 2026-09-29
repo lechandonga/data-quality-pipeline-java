@@ -3,7 +3,10 @@ package com.github.lechandonga.dataqualitypipelinejava.config;
 import com.github.lechandonga.dataqualitypipelinejava.baseline.BaselineStore;
 import com.github.lechandonga.dataqualitypipelinejava.baseline.FileBaselineStore;
 import com.github.lechandonga.dataqualitypipelinejava.baseline.InMemoryBaselineStore;
+import com.github.lechandonga.dataqualitypipelinejava.archive.BatchArchiveStore;
+import com.github.lechandonga.dataqualitypipelinejava.archive.FileBatchArchiveStore;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
@@ -21,5 +24,15 @@ public class PipelineConfig {
             return new FileBaselineStore(props.baselineDir());
         }
         return new InMemoryBaselineStore();
+    }
+
+    /**
+     * 批次结论存档：配置 dqp.archive-dir 后启用"临时文件 + 原子 move"的本地存档；
+     * 未配置时为 null，批次结论仅存内存（行为明确，不是静默丢失）。
+     */
+    @Bean
+    @ConditionalOnProperty(name = "dqp.archive-dir")
+    public BatchArchiveStore batchArchiveStore(PipelineProperties props) {
+        return new FileBatchArchiveStore(props.archiveDir());
     }
 }

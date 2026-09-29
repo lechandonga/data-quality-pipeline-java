@@ -53,11 +53,11 @@ class PipelineConcurrencyTest {
     }
 
     private PipelineService pipeline(PipelineProperties props) {
-        return new PipelineService(registry, new BaselineService(store), props);
+        return PipelineService.withoutArchive(registry, new BaselineService(store), props);
     }
 
     private PipelineProperties props(int workers, int queue, int distinct, OverflowPolicy policy) {
-        return new PipelineProperties(workers, 2, queue, distinct, policy, 3.0, 0.3, null);
+        return new PipelineProperties(workers, 2, queue, distinct, policy, 3.0, 0.3, null, null, 100);
     }
 
     private List<DataRecord> dataset(int n) {
@@ -168,8 +168,8 @@ class PipelineConcurrencyTest {
     @Timeout(90)
     void sameRulesConcurrentBatchesProduceConsistentIndependentResults() throws Exception {
         PipelineProperties p2 = new PipelineProperties(4, 16, 1_000, 2_000_000,
-                OverflowPolicy.ISOLATE, 3.0, 0.3, null);
-        PipelineService p = new PipelineService(registry, new BaselineService(store), p2);
+                OverflowPolicy.ISOLATE, 3.0, 0.3, null, null, 100);
+        PipelineService p = PipelineService.withoutArchive(registry, new BaselineService(store), p2);
         List<DataRecord> data = dataset(2_000);
 
         int threads = 12;
@@ -194,8 +194,8 @@ class PipelineConcurrencyTest {
     @Timeout(30)
     void concurrentBatchLimitIsEnforced() throws Exception {
         PipelineProperties p2 = new PipelineProperties(1, 2, 1_000, 2_000_000,
-                OverflowPolicy.ISOLATE, 3.0, 0.3, null);
-        PipelineService p = new PipelineService(registry, new BaselineService(store), p2);
+                OverflowPolicy.ISOLATE, 3.0, 0.3, null, null, 100);
+        PipelineService p = PipelineService.withoutArchive(registry, new BaselineService(store), p2);
         registry.publish(new com.github.lechandonga.dataqualitypipelinejava.rule.RuleSet(
                 "slow", List.of(new SlowRule("slow", 300)), List.of()));
 

@@ -18,10 +18,15 @@ public record BatchResult(
         List<RuleViolation> violations,
         List<DriftFinding> driftFindings,
         boolean baselineUpdated,
-        String rejectReason
+        String rejectReason,
+        PersistenceStatus persistenceStatus
 ) {
 
     public boolean committed() {
         return status == BatchStatus.COMMITTED;
+    }
+
+    public boolean persisted() {
+        return persistenceStatus == PersistenceStatus.PERSISTED;
     }
 }

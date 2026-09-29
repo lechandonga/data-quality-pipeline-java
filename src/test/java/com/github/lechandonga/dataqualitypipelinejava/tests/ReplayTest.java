@@ -36,7 +36,7 @@ class ReplayTest {
 
     private PipelineProperties props() {
         return new PipelineProperties(4, 8, 256, 1_000_000,
-                OverflowPolicy.ISOLATE, 3.0, 0.3, null);
+                OverflowPolicy.ISOLATE, 3.0, 0.3, null, null, 100);
     }
 
     @BeforeEach
@@ -46,13 +46,13 @@ class ReplayTest {
         registry.replaceAll(List.of(
                 notNull("nn-v", "v"),
                 range("r-v", "v", "0", "100"),
-                unique("u-id", List.of("id"))));
-        pipeline = new PipelineService(registry, new BaselineService(store), props());
+                unique("u-key", List.of("key"))));
+        pipeline = PipelineService.withoutArchive(registry, new BaselineService(store), props());
     }
 
     private DataRecord recV(long order, String recId, String id, String v) {
         Map<String, String> d = new LinkedHashMap<>();
-        d.put("id", id);
+        d.put("key", id);
         if (v != null) {
             d.put("v", v);
         }
@@ -79,10 +79,9 @@ class ReplayTest {
         assertEquals(3, replayed.passedCount());
         assertEquals(1, replayed.quarantinedCount());
 
-        // 再次同样重放，结论不变（幂等）
+        // 再次重放"当前仍隔离"的记录（内容原样），结论不变（幂等）
         BatchResult again = pipeline.replay("b1", List.of(
-                recV(1, "rec-1", "id-1", "50"),
-                recV(2, "rec-2", "id-2", "20")).iterator());
+                recV(3, "rec-3", "id-0", "10")).iterator());
         assertEquals(replayed.passedCount(), again.passedCount());
         assertEquals(replayed.quarantinedCount(), again.quarantinedCount());
         assertEquals(
@@ -115,7 +114,7 @@ class ReplayTest {
         registry.replaceAll(List.of(
                 notNull("nn-v", "v"),
                 range("r-v", "v", "0", "10"),
-                unique("u-id", List.of("id"))));
+                unique("u-key", List.of("key"))));
 
         assertThrows(IllegalStateException.class,
                 () -> pipeline.replay("b1", List.of(recV(1, "rec-1", "id-1", "5")).iterator()),
@@ -151,8 +150,8 @@ class ReplayTest {
         BatchResult r = pipeline.replay("b1", List.of(recV(1, "rec-1", "id-0", "10")).iterator());
         var stillBad = r.violations().get(1);
         assertEquals(RecordStatus.QUARANTINED, stillBad.status());
-        assertEquals("u-id", stillBad.reasons().get(0).ruleId());
-        assertEquals("id", stillBad.reasons().get(0).field());
+        assertEquals("u-key", stillBad.reasons().get(0).ruleId());
+        assertEquals("key", stillBad.reasons().get(0).field());
         assertFalse(stillBad.reasons().get(0).expected().isBlank());
     }
 }

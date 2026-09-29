@@ -3,6 +3,10 @@ package com.github.lechandonga.dataqualitypipelinejava.pipeline;
 import com.github.lechandonga.dataqualitypipelinejava.baseline.BaselineCommitException;
 import com.github.lechandonga.dataqualitypipelinejava.baseline.BaselineService;
 import com.github.lechandonga.dataqualitypipelinejava.baseline.BatchStatisticsAccumulator;
+import com.github.lechandonga.dataqualitypipelinejava.archive.BatchArchiveCorruptedException;
+import com.github.lechandonga.dataqualitypipelinejava.archive.BatchArchiveException;
+import com.github.lechandonga.dataqualitypipelinejava.archive.BatchArchiveStore;
+import com.github.lechandonga.dataqualitypipelinejava.archive.BatchSnapshot;
 import com.github.lechandonga.dataqualitypipelinejava.config.PipelineProperties;
 import com.github.lechandonga.dataqualitypipelinejava.model.BatchResult;
 import com.github.lechandonga.dataqualitypipelinejava.model.BatchStatus;
@@ -12,6 +16,7 @@ import com.github.lechandonga.dataqualitypipelinejava.model.DriftStatus;
 import com.github.lechandonga.dataqualitypipelinejava.model.FailureReason;
 import com.github.lechandonga.dataqualitypipelinejava.model.FieldStats;
 import com.github.lechandonga.dataqualitypipelinejava.model.OverflowPolicy;
+import com.github.lechandonga.dataqualitypipelinejava.model.PersistenceStatus;
 import com.github.lechandonga.dataqualitypipelinejava.model.RecordStatus;
 import com.github.lechandonga.dataqualitypipelinejava.model.RuleViolation;
 import com.github.lechandonga.dataqualitypipelinejava.rule.RowRule;
@@ -22,6 +27,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.slf4j.MDC;
 import org.springframework.stereotype.Service;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.ObjectProvider;
 
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -37,6 +44,8 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 
 /**
  * 数据质量校验流水线门面。
@@ -62,16 +71,49 @@ public class PipelineService {
     private final RuleRegistry ruleRegistry;
     private final BaselineService baselineService;
     private final PipelineProperties properties;
+    private final BatchArchiveStore archiveStore;
     private final Semaphore concurrencyLimiter;
-    private final Map<String, RunState> runs = new ConcurrentHashMap<>();
 
+    /**
+     * 批次结论登记表（进程内有界）。
+     * keys 为批次插入顺序：超过上限时最旧的先逐出。所有访问在 {@code registryLock}
+     * 下进行，查询/重放只会看到完整的旧结论或完整的新结论，不会读到中间态。
+     * pinned > 0 的批次（正在执行/重放/读取）不会被逐出。
+     */
+    private final Object registryLock = new Object();
+    private final Map<String, RunState> runs = new LinkedHashMap<>();
+    /** 未开启存档时被逐出的批次 id：查询时显式标记为"曾经存在但已不可用"。 */
+    private final Set<String> evictedWithoutArchive = new LinkedHashSet<>();
+
+    @Autowired
     public PipelineService(RuleRegistry ruleRegistry,
                            BaselineService baselineService,
-                           PipelineProperties properties) {
+                           PipelineProperties properties,
+                           ObjectProvider<BatchArchiveStore> archiveStoreProvider) {
         this.ruleRegistry = ruleRegistry;
         this.baselineService = baselineService;
         this.properties = properties;
+        this.archiveStore = archiveStoreProvider.getIfAvailable();
         this.concurrencyLimiter = new Semaphore(Math.max(1, properties.maxConcurrentBatches()));
+    }
+
+    public PipelineService(RuleRegistry ruleRegistry,
+                           BaselineService baselineService,
+                           PipelineProperties properties,
+                           BatchArchiveStore archiveStore) {
+        this.ruleRegistry = ruleRegistry;
+        this.baselineService = baselineService;
+        this.properties = properties;
+        this.archiveStore = archiveStore;
+        this.concurrencyLimiter = new Semaphore(Math.max(1, properties.maxConcurrentBatches()));
+    }
+
+    /** 未启用存档时的测试/手动装配入口。 */
+    public static PipelineService withoutArchive(RuleRegistry ruleRegistry,
+                                                 BaselineService baselineService,
+                                                 PipelineProperties properties) {
+        return new PipelineService(ruleRegistry, baselineService, properties,
+                (BatchArchiveStore) null);
     }
 
     /** 流式执行一个批次；输入为迭代器，全程不全量加载。 */
@@ -96,8 +138,7 @@ public class PipelineService {
                 BatchResult result = finalize(request.batchId(), request.dataset(), rules, props,
                         state, request.commit());
                 state.result = result;
-                runs.put(request.batchId(), state);
-                return result;
+                return registerFinished(request.batchId(), state, result, request.commit());
             } finally {
                 concurrencyLimiter.release();
             }
@@ -112,49 +153,333 @@ public class PipelineService {
      * 已通过记录结论不变、不重复计数；重放不会再次更新基线。
      */
     public BatchResult replay(String batchId, Iterator<DataRecord> repairedRecords) {
-        RunState original = runs.get(batchId);
-        if (original == null) {
-            throw new IllegalArgumentException("batch not found or already evicted: " + batchId);
-        }
-        RuleSet rules = ruleRegistry.current();
-        if (!rules.version().equals(original.rulesVersion)) {
-            throw new IllegalStateException(
-                    "rules changed since batch execution (was " + original.rulesVersion
-                            + ", now " + rules.version() + "); replay requires the same rules version");
-        }
-        MDC.put("batchId", batchId);
-        try {
-            // 被拒绝的批次没有完整结论，禁止重放
-            if (original.result != null && original.result.status() == BatchStatus.REJECTED) {
-                throw new IllegalStateException("rejected batch cannot be replayed: " + batchId);
-            }
-            // 待重放的是"被隔离记录"子集，规模可控；先收集 id 以便从旧状态中一次性剔除，
-            // 避免新旧结论并存导致重复计数
-            List<DataRecord> repaired = new ArrayList<>();
-            repairedRecords.forEachRemaining(repaired::add);
-            Set<String> replayIds = new HashSet<>();
-            for (DataRecord r : repaired) {
-                replayIds.add(r.id());
-            }
-            RunState state = stream(original.dataset, rules, original.props,
-                    original.workers, repaired.iterator(), original, replayIds);
-            BatchResult result = finalizeReplay(batchId, rules, original, state);
-            state.result = result;
-            runs.put(batchId, state);
-            return result;
-        } finally {
-            MDC.remove("batchId");
-        }
+        return replayWithReport(batchId, repairedRecords).result();
     }
 
     public Optional<BatchResult> resultOf(String batchId) {
-        RunState s = runs.get(batchId);
-        return s == null ? Optional.empty() : Optional.ofNullable(s.result);
+        return switch (lookup(batchId)) {
+            case Lookup.Found found -> Optional.of(found.result());
+            case Lookup.Evicted ignored -> Optional.empty();
+            case Lookup.NotFound ignored -> Optional.empty();
+            case Lookup.Corrupt ignored -> Optional.empty();
+        };
     }
 
     // ------------------------------------------------------------------
     // 流式摄入 + 有界并行评估
     // ------------------------------------------------------------------
+
+    // ------------------------------------------------------------------
+    // 批次登记表、存档与隔离导出/重放闭环
+    // ------------------------------------------------------------------
+
+    /** 查询结论的可用性：找到（含从存档恢复）、已逐出不可用、从未存在、存档损坏。 */
+    public sealed interface Lookup permits Lookup.Found, Lookup.Evicted, Lookup.NotFound, Lookup.Corrupt {
+        record Found(BatchResult result) implements Lookup {
+        }
+
+        record Evicted(String batchId) implements Lookup {
+        }
+
+        record NotFound(String batchId) implements Lookup {
+        }
+
+        record Corrupt(String batchId, String message) implements Lookup {
+        }
+    }
+
+    /**
+     * 查询批次结论。内存未命中且开启存档时从磁盘完整恢复；存档损坏原样向上抛出，
+     * 不静默当成不存在；未开启存档且已被逐出时显式返回 {@link Lookup.Evicted}。
+     */
+    public Lookup lookup(String batchId) {
+        synchronized (registryLock) {
+            RunState live = runs.get(batchId);
+            if (live != null) {
+                return new Lookup.Found(live.result);
+            }
+            if (archiveStore != null) {
+                BatchSnapshot snapshot;
+                try {
+                    snapshot = archiveStore.load(batchId).orElse(null);
+                } catch (BatchArchiveCorruptedException ex) {
+                    return new Lookup.Corrupt(batchId, ex.getMessage());
+                }
+                if (snapshot != null) {
+                    RunState restored = toRunState(snapshot);
+                    restored.result = snapshot.toResult();
+                    runs.put(batchId, restored);
+                    evictedWithoutArchive.remove(batchId);
+                    evictIfNeeded();
+                    return new Lookup.Found(restored.result);
+                }
+            }
+            if (evictedWithoutArchive.contains(batchId)) {
+                return new Lookup.Evicted(batchId);
+            }
+            return new Lookup.NotFound(batchId);
+        }
+    }
+
+    /**
+     * 导出批次当前仍被隔离的记录：保留记录标识、原始顺序与原始字段内容，
+     * 可直接作为修复文件回灌重放。
+     */
+    public List<DataRecord> exportQuarantined(String batchId) {
+        RunState state = resolveForAccess(batchId);
+        List<DataRecord> out = new ArrayList<>();
+        for (ViolationEntry e : orderedEntries(state)) {
+            if (!e.violation.passed()) {
+                out.add(new DataRecord(e.record.id(), e.order, e.record.data()));
+            }
+        }
+        return out;
+    }
+
+    /**
+     * 修复重放并返回分类报告：本次因修复转为通过、修复后仍隔离、
+     * 不属于该批次隔离清单（整次输入整体拒绝，批次结论不变）。
+     */
+    public ReplayReport replayWithReport(String batchId, Iterator<DataRecord> repairedRecords) {
+        RunState original;
+        synchronized (registryLock) {
+            original = resolveForAccess(batchId);
+            pin(original);
+        }
+        MDC.put("batchId", batchId);
+        try {
+            if (original.result != null && original.result.status() == BatchStatus.REJECTED) {
+                throw new IllegalStateException("rejected batch cannot be replayed: " + batchId);
+            }
+            RuleSet rules = ruleRegistry.current();
+            if (!rules.version().equals(original.rulesVersion)) {
+                throw new IllegalStateException(
+                        "rules changed since batch execution (was " + original.rulesVersion
+                                + ", now " + rules.version() + "); replay requires the same rules version");
+            }
+            // 待重放的是"被隔离记录"子集，先完整收集再做整体校验：
+            // 任何一条非法都整体不生效，绝不允许只重放一部分
+            List<DataRecord> repaired = new ArrayList<>();
+            repairedRecords.forEachRemaining(repaired::add);
+
+            Set<String> currentQuarantineIds = new LinkedHashSet<>();
+            synchronized (original.entries) {
+                for (ViolationEntry e : original.entries) {
+                    if (!e.violation.passed()) {
+                        currentQuarantineIds.add(e.record.id());
+                    }
+                }
+            }
+            Set<String> replayIds = new LinkedHashSet<>();
+            List<String> notInList = new ArrayList<>();
+            for (DataRecord r : repaired) {
+                replayIds.add(r.id());
+                if (!currentQuarantineIds.contains(r.id())) {
+                    notInList.add(r.id());
+                }
+            }
+            if (!notInList.isEmpty()) {
+                throw new BatchReplayRejectedException(batchId, notInList);
+            }
+
+            RunState state = stream(original.dataset, rules, original.props,
+                    original.workers, repaired.iterator(), original, replayIds);
+            if (state.rejected) {
+                // 重放触发硬 REJECT：保留原批次结论，不产生部分重放
+                log.warn("replay rejected, preserving original result: batchId={}, reason={}",
+                        batchId, state.rejectReason);
+                return new ReplayReport(original.result, List.of(), List.of(), List.of(), true);
+            }
+            BatchResult result = finalizeReplay(batchId, rules, original, state);
+            state.result = result;
+
+            // 分类以重放后的完整状态为准：
+            // repairedPassed = 本次输入 id 中重放后通过的；
+            // stillQuarantined = 整批当前仍隔离的全部记录（含本次仍失败与未参与本次的）。
+            List<String> repairedPassed = new ArrayList<>();
+            List<String> stillQuarantined = new ArrayList<>();
+            for (ViolationEntry e : orderedEntries(state)) {
+                if (!e.violation.passed()) {
+                    stillQuarantined.add(e.record.id());
+                } else if (replayIds.contains(e.record.id())) {
+                    repairedPassed.add(e.record.id());
+                }
+            }
+
+            persistAfterReplay(batchId, state);
+            synchronized (registryLock) {
+                // 同一把锁内替换：读者只会看到完整旧结论或完整新结论
+                runs.remove(batchId);
+                runs.put(batchId, state);
+            }
+            return new ReplayReport(state.result, List.copyOf(repairedPassed),
+                    List.copyOf(stillQuarantined), List.of(), false);
+        } finally {
+            synchronized (registryLock) {
+                unpin(original);
+            }
+            MDC.remove("batchId");
+        }
+    }
+
+    /**
+     * 取批次可操作状态：内存命中直接用；否则开启存档时从磁盘恢复；
+     * 未存档且已逐出 → 显式 IllegalStateException；从未存在 → IllegalArgumentException。
+     */
+    private RunState resolveForAccess(String batchId) {
+        synchronized (registryLock) {
+            RunState live = runs.get(batchId);
+            if (live != null) {
+                return live;
+            }
+            if (archiveStore != null) {
+                BatchSnapshot snapshot = archiveStore.load(batchId).orElse(null);
+                if (snapshot != null) {
+                    RunState restored = toRunState(snapshot);
+                    restored.result = snapshot.toResult();
+                    runs.put(batchId, restored);
+                    evictedWithoutArchive.remove(batchId);
+                    evictIfNeeded();
+                    return restored;
+                }
+            }
+            if (evictedWithoutArchive.contains(batchId)) {
+                throw new IllegalStateException(
+                        "batch existed but was evicted from memory without an archive: " + batchId);
+            }
+            throw new IllegalArgumentException("batch not found: " + batchId);
+        }
+    }
+
+    /**
+     * 登记执行完成的批次：先原子存档，再放进有界内存登记表。
+     * 落盘失败不影响本次返回结论，只显式标记为 NOT_PERSISTED。
+     */
+    private BatchResult registerFinished(String batchId, RunState state, BatchResult result,
+                                         boolean commit) {
+        state.commit = commit;
+        PersistenceStatus persistence;
+        if (archiveStore == null) {
+            persistence = PersistenceStatus.IN_MEMORY;
+        } else {
+            try {
+                archiveStore.save(toSnapshot(batchId, state, result));
+                persistence = PersistenceStatus.PERSISTED;
+            } catch (BatchArchiveException ex) {
+                log.error("batch archive write failed; result kept but NOT persisted: "
+                        + "batchId={}, error={}", batchId, ex.getMessage());
+                persistence = PersistenceStatus.NOT_PERSISTED;
+            }
+        }
+        BatchResult effective = withPersistence(result, persistence);
+        state.result = effective;
+        synchronized (registryLock) {
+            evictedWithoutArchive.remove(batchId);
+            runs.put(batchId, state);
+            evictIfNeeded();
+        }
+        return effective;
+    }
+
+    private void persistAfterReplay(String batchId, RunState state) {
+        if (archiveStore == null) {
+            state.result = withPersistence(state.result, PersistenceStatus.IN_MEMORY);
+            return;
+        }
+        try {
+            archiveStore.save(toSnapshot(batchId, state, state.result));
+            state.result = withPersistence(state.result, PersistenceStatus.PERSISTED);
+        } catch (BatchArchiveException ex) {
+            log.error("batch archive rewrite failed after replay; result kept in memory "
+                    + "but NOT persisted: batchId={}, error={}", batchId, ex.getMessage());
+            state.result = withPersistence(state.result, PersistenceStatus.NOT_PERSISTED);
+        }
+    }
+
+    /**
+     * 超过保留上限时按最旧顺序逐出；pin 中的批次（执行/重放中）跳过，
+     * 绝不清理正在使用的状态。未安全落盘的条目留下 tombstone，
+     * 查询时显式区分为"曾经存在但已不可用"。
+     */
+    private void evictIfNeeded() {
+        int limit = Math.max(1, properties.maxInMemoryBatches());
+        Iterator<Map.Entry<String, RunState>> it = runs.entrySet().iterator();
+        while (runs.size() > limit && it.hasNext()) {
+            Map.Entry<String, RunState> e = it.next();
+            if (e.getValue().pins > 0) {
+                continue;
+            }
+            it.remove();
+            boolean persisted = e.getValue().result != null
+                    && e.getValue().result.persistenceStatus() == PersistenceStatus.PERSISTED;
+            if (!persisted) {
+                evictedWithoutArchive.add(e.getKey());
+            }
+            log.debug("batch evicted from memory: batchId={}, persisted={}",
+                    e.getKey(), persisted);
+        }
+    }
+
+    private void pin(RunState state) {
+        state.pins++;
+    }
+
+    private void unpin(RunState state) {
+        state.pins--;
+    }
+
+    private static BatchResult withPersistence(BatchResult r, PersistenceStatus status) {
+        return new BatchResult(r.batchId(), r.dataset(), r.status(), r.rulesVersion(),
+                r.total(), r.passedCount(), r.quarantinedCount(), r.overflowIsolatedCount(),
+                r.violations(), r.driftFindings(), r.baselineUpdated(),
+                r.rejectReason(), status);
+    }
+
+    private BatchSnapshot toSnapshot(String batchId, RunState state, BatchResult result) {
+        List<BatchSnapshot.Entry> entries = new ArrayList<>();
+        for (ViolationEntry e : orderedEntries(state)) {
+            entries.add(new BatchSnapshot.Entry(e.order, e.record.id(),
+                    new LinkedHashMap<>(e.record.data()),
+                    e.violation.status(), List.copyOf(e.violation.reasons())));
+        }
+        return new BatchSnapshot(batchId, state.dataset, result.status(),
+                state.rulesVersion, state.workers, state.commit, result.rejectReason(),
+                result.driftFindings(), result.baselineUpdated(), List.copyOf(entries));
+    }
+
+    private RunState toRunState(BatchSnapshot snapshot) {
+        RunState state = new RunState();
+        state.dataset = snapshot.dataset();
+        state.rulesVersion = snapshot.rulesVersion();
+        // 重放沿用执行时的容量/并发口径；存档目录属于部署配置，不参与结论
+        state.props = new PipelineProperties(snapshot.workers(),
+                properties.maxConcurrentBatches(), properties.queueCapacity(),
+                properties.distinctCapacity(), properties.overflowPolicy(),
+                properties.meanShiftThreshold(), properties.stdShiftThreshold(),
+                null, properties.archiveDir(), properties.maxInMemoryBatches());
+        state.workers = snapshot.workers();
+        state.commit = snapshot.commit();
+        RuleSet rules = ruleRegistry.current();
+        long maxOrder = -1;
+        for (BatchSnapshot.Entry e : snapshot.entries()) {
+            RuleViolation v = new RuleViolation(e.recordId(), e.status(),
+                    List.copyOf(e.reasons()));
+            DataRecord record = new DataRecord(e.recordId(), e.order(),
+                    new LinkedHashMap<>(e.data()));
+            state.entries.add(new ViolationEntry(e.order(), record, v));
+            maxOrder = Math.max(maxOrder, e.order());
+            if (v.passed()) {
+                for (UniqueRule u : rules.uniqueRules()) {
+                    state.uniqueKeys.computeIfAbsent(u.id(), k -> new HashSet<>())
+                            .add(u.keyOf(record));
+                    state.firstSeenRecord.computeIfAbsent(u.id(), k -> new HashMap<>())
+                            .putIfAbsent(u.keyOf(record), record.id());
+                }
+            }
+        }
+        state.nextOrder = maxOrder + 1;
+        return state;
+    }
 
     private RunState stream(String dataset, RuleSet rules, PipelineProperties props, int workers,
                             Iterator<DataRecord> input, RunState seed, Set<String> replayIds) {
@@ -361,8 +686,10 @@ public class PipelineService {
         }
         long maxOrder = -1;
         for (ViolationEntry e : seed.entries) {
-            // 待重放记录的旧结论整体丢弃，由新结论替换（幂等、不重复计数）
-            if (replayIds != null && replayIds.contains(e.record.id())) {
+            // 只丢弃"当前仍隔离且本次提交了修复"的旧结论；上轮已修复转为通过的记录
+            // 不属于隔离清单（重放入口已整体校验），其唯一键必须保留，保证反复重放幂等
+            if (replayIds != null && replayIds.contains(e.record.id())
+                    && !e.violation.passed()) {
                 continue;
             }
             maxOrder = Math.max(maxOrder, e.order);
@@ -390,7 +717,9 @@ public class PipelineService {
         if (state.rejected) {
             // 被拒绝批次：不统计、不查漂移、不提交，绝不污染基线
             return new BatchResult(batchId, dataset, BatchStatus.REJECTED, rules.version(),
-                    0, 0, 0, 0L, List.of(), List.of(), false, state.rejectReason);
+                    0, 0, 0, 0L, List.of(), List.of(), false, state.rejectReason,
+                    archiveStore == null ? PersistenceStatus.IN_MEMORY
+                            : PersistenceStatus.NOT_PERSISTED);
         }
 
         List<ViolationEntry> ordered = orderedEntries(state);
@@ -440,7 +769,9 @@ public class PipelineService {
         return new BatchResult(batchId, dataset, status, rules.version(), ordered.size(),
                 countPassed(ordered), ordered.size() - countPassed(ordered),
                 countOverflow(ordered), toViolations(ordered), List.copyOf(drift),
-                baselineUpdated, null);
+                baselineUpdated, null,
+                archiveStore == null ? PersistenceStatus.IN_MEMORY
+                        : PersistenceStatus.NOT_PERSISTED);
     }
 
     /**
@@ -467,7 +798,9 @@ public class PipelineService {
                 batchId, ordered.size(), passed, ordered.size() - passed);
         return new BatchResult(batchId, original.dataset, status, rules.version(), ordered.size(),
                 passed, ordered.size() - passed, countOverflow(ordered),
-                toViolations(ordered), drift, baselineUpdated, null);
+                toViolations(ordered), drift, baselineUpdated, null,
+                original.result != null ? original.result.persistenceStatus()
+                        : PersistenceStatus.IN_MEMORY);
     }
 
     private List<ViolationEntry> orderedEntries(RunState state) {
@@ -532,6 +865,9 @@ public class PipelineService {
         volatile String rulesVersion;
         volatile PipelineProperties props;
         volatile int workers;
+        volatile boolean commit;
+        /** 执行/重放期间的引用计数，> 0 时内存逐出必须跳过该批次。 */
+        int pins;
         final List<ViolationEntry> entries = java.util.Collections.synchronizedList(new ArrayList<>());
         final Map<String, Set<String>> uniqueKeys = new ConcurrentHashMap<>();
         final Map<String, Map<String, String>> firstSeenRecord = new ConcurrentHashMap<>();
